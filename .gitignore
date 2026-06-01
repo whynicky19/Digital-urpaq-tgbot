@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# База данных
+*.db
+*.sqlite3
+
+# Токены и секреты
+.env
+config.py
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE
+.idea/
+.vscode/
+
+# Логи
+*.log

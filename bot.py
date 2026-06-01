@@ -1,0 +1,961 @@
+import asyncio
+import logging
+import sqlite3
+from datetime import datetime
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+)
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# ===== НАСТРОЙКИ =====
+BOT_TOKEN = "8968396821:AAE4TjbxPlKr5c_QFm5GKfxG8tqLG0imXfk"  # @BotFather -> /newbot
+ADMIN_IDS = [1575295202]  # Вставь свой Telegram user_id (узнать: @userinfobot)
+
+# ===== ЛОГИРОВАНИЕ =====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ===== БАЗА ДАННЫХ =====
+def init_db() -> None:
+    conn = sqlite3.connect("digital_urqaq.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kruzhki (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            direction TEXT,
+            age_category TEXT,
+            teacher TEXT,
+            schedule TEXT,
+            room TEXT,
+            max_slots INTEGER DEFAULT 20,
+            is_open INTEGER DEFAULT 1
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS zayavki (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER,
+            full_name TEXT,
+            age INTEGER,
+            phone TEXT,
+            kruzhok_id INTEGER,
+            kruzhok_name TEXT,
+            comment TEXT,
+            status TEXT DEFAULT 'новая',
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS novosti (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            content TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("SELECT COUNT(*) FROM kruzhki")
+    if cur.fetchone()[0] == 0:
+        test_kruzhki = [
+            ("Программирование (Python)", "Основы Python, алгоритмы, создание проектов", "IT", "14-18 лет", "Ахметов А.А.", "Пн, Ср 15:00-17:00", "Каб. 201", 15, 1),
+            ("Робототехника", "Сборка и программирование роботов Arduino", "IT", "12-18 лет", "Бекова Б.Б.", "Вт, Чт 14:00-16:00", "Каб. 105", 10, 1),
+            ("Дизайн и Photoshop", "Графический дизайн, UI/UX, Adobe Photoshop", "Творчество", "14-18 лет", "Сатова С.С.", "Пн, Пт 16:00-18:00", "Каб. 302", 12, 1),
+            ("Английский язык (Разговорный)", "Разговорный английский, подготовка к IELTS", "Языки", "13-18 лет", "Нурова Н.Н.", "Ср, Пт 15:00-17:00", "Каб. 204", 20, 1),
+            ("Шахматы", "Стратегическое мышление, турниры", "Спорт", "10-18 лет", "Касымов К.К.", "Вт, Сб 10:00-12:00", "Каб. 110", 25, 0),
+        ]
+        cur.executemany(
+            "INSERT INTO kruzhki (name, description, direction, age_category, teacher, schedule, room, max_slots, is_open) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            test_kruzhki
+        )
+
+    cur.execute("SELECT COUNT(*) FROM novosti")
+    if cur.fetchone()[0] == 0:
+        cur.execute(
+            "INSERT INTO novosti (title, content, created_at) VALUES (?, ?, ?)",
+            ("🎉 Добро пожаловать в Digital Urqaq!", "Открыта запись на кружки нового сезона! Спешите занять место.", datetime.now().strftime("%d.%m.%Y"))
+        )
+        cur.execute(
+            "INSERT INTO novosti (title, content, created_at) VALUES (?, ?, ?)",
+            ("📅 Летняя Академия Digital Urqaq", "Приём заявок в Летнюю Академию открыт до 15 июня. Не пропустите!", datetime.now().strftime("%d.%m.%Y"))
+        )
+
+    conn.commit()
+    conn.close()
+
+def get_db() -> sqlite3.Connection:
+    return sqlite3.connect("digital_urqaq.db")
+
+# ===== СОСТОЯНИЯ FSM =====
+class ZayavkaForm(StatesGroup):
+    full_name = State()
+    age = State()
+    phone = State()
+    kruzhok_id = State()
+    comment = State()
+    confirm = State()
+
+class AdminNews(StatesGroup):
+    title = State()
+    content = State()
+
+class AdminKruzhok(StatesGroup):
+    name = State()
+    description = State()
+    direction = State()
+    age_category = State()
+    teacher = State()
+    schedule = State()
+    room = State()
+    max_slots = State()
+
+# ===== КЛАВИАТУРЫ =====
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📚 Кружки"), KeyboardButton(text="📝 Подать заявку")],
+            [KeyboardButton(text="📰 Новости"), KeyboardButton(text="📋 Мои заявки")],
+            [KeyboardButton(text="ℹ️ О нас"), KeyboardButton(text="📞 Контакты")],
+        ],
+        resize_keyboard=True
+    )
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📚 Кружки"), KeyboardButton(text="📝 Подать заявку")],
+            [KeyboardButton(text="📰 Новости"), KeyboardButton(text="📋 Мои заявки")],
+            [KeyboardButton(text="🔧 Админ-панель"), KeyboardButton(text="ℹ️ О нас")],
+        ],
+        resize_keyboard=True
+    )
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Все заявки", callback_data="admin_all_zayavki")],
+        [InlineKeyboardButton(text="✅ Новые заявки", callback_data="admin_new_zayavki")],
+        [InlineKeyboardButton(text="➕ Добавить кружок", callback_data="admin_add_kruzhok")],
+        [InlineKeyboardButton(text="📢 Опубликовать новость", callback_data="admin_add_news")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+    ])
+
+def kruzhki_keyboard(kruzhki_list: list) -> InlineKeyboardMarkup:
+    buttons = []
+    for k in kruzhki_list:
+        status = "✅" if k[9] else "🔒"
+        buttons.append([InlineKeyboardButton(
+            text=f"{status} {k[1]}",
+            callback_data=f"kruzhok_{k[0]}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def kruzhok_detail_keyboard(kruzhok_id: int, is_open: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    if is_open:
+        buttons.append([InlineKeyboardButton(text="📝 Записаться", callback_data=f"zapis_{kruzhok_id}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data="back_kruzhki")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def zayavka_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_yes"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="confirm_no"),
+        ]
+    ])
+
+def zayavka_status_keyboard(zayavka_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{zayavka_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{zayavka_id}"),
+        ],
+        [InlineKeyboardButton(text="⏳ В ожидании", callback_data=f"pending_{zayavka_id}")],
+    ])
+
+# ===== ХЕНДЛЕРЫ =====
+
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = message.from_user
+    if user is None:
+        return
+    is_admin = user.id in ADMIN_IDS
+    kb = admin_keyboard() if is_admin else main_keyboard()
+    first_name = user.first_name or "друг"
+
+    await message.answer(
+        f"👋 Привет, <b>{first_name}</b>!\n\n"
+        "🏫 Добро пожаловать в бот <b>Дворца школьников Digital Urqaq</b>!\n\n"
+        "Здесь ты можешь:\n"
+        "📚 Посмотреть кружки и секции\n"
+        "📝 Подать заявку на обучение\n"
+        "📰 Читать новости и объявления\n\n"
+        "Выбери действие в меню 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+async def show_kruzhki(message: Message) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM kruzhki ORDER BY is_open DESC, name")
+    kruzhki = cur.fetchall()
+    conn.close()
+
+    if not kruzhki:
+        await message.answer("📚 Кружки пока не добавлены.")
+        return
+
+    await message.answer(
+        "📚 <b>Список кружков Digital Urqaq</b>\n\n"
+        "✅ — запись открыта | 🔒 — набор закрыт\n\n"
+        "Выбери кружок для подробной информации:",
+        parse_mode="HTML",
+        reply_markup=kruzhki_keyboard(kruzhki)
+    )
+
+async def kruzhok_detail(callback: CallbackQuery) -> None:
+    if callback.data is None or callback.message is None:
+        return
+    # InaccessibleMessage не имеет edit_text — проверяем через isinstance
+    if not isinstance(callback.message, Message):
+        await callback.answer("Сообщение недоступно.")
+        return
+
+    kruzhok_id = int(callback.data.split("_")[1])
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM kruzhki WHERE id = ?", (kruzhok_id,))
+    k = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FROM zayavki WHERE kruzhok_id = ? AND status != 'отклонена'", (kruzhok_id,))
+    taken = cur.fetchone()[0]
+    conn.close()
+
+    if not k:
+        await callback.answer("Кружок не найден!")
+        return
+
+    status_text = "✅ Набор открыт" if k[9] else "🔒 Набор закрыт"
+    free_slots = max(0, k[8] - taken)
+
+    text = (
+        f"📚 <b>{k[1]}</b>\n\n"
+        f"📖 <b>Описание:</b> {k[2]}\n"
+        f"🎯 <b>Направление:</b> {k[3]}\n"
+        f"👤 <b>Возраст:</b> {k[4]}\n"
+        f"👨‍🏫 <b>Преподаватель:</b> {k[5]}\n"
+        f"🕐 <b>Расписание:</b> {k[6]}\n"
+        f"🚪 <b>Кабинет:</b> {k[7]}\n"
+        f"🪑 <b>Мест:</b> {free_slots} из {k[8]}\n"
+        f"📊 <b>Статус:</b> {status_text}"
+    )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=kruzhok_detail_keyboard(kruzhok_id, bool(k[9]) and free_slots > 0)
+    )
+    await callback.answer()
+
+async def back_to_kruzhki(callback: CallbackQuery) -> None:
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM kruzhki ORDER BY is_open DESC, name")
+    kruzhki = cur.fetchall()
+    conn.close()
+
+    await callback.message.edit_text(
+        "📚 <b>Список кружков Digital Urqaq</b>\n\n"
+        "✅ — запись открыта | 🔒 — набор закрыт\n\n"
+        "Выбери кружок для подробной информации:",
+        parse_mode="HTML",
+        reply_markup=kruzhki_keyboard(kruzhki)
+    )
+    await callback.answer()
+
+# ===== ПОДАЧА ЗАЯВКИ =====
+
+async def start_zayavka_menu(message: Message, state: FSMContext) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM kruzhki WHERE is_open = 1 ORDER BY name")
+    kruzhki = cur.fetchall()
+    conn.close()
+
+    if not kruzhki:
+        await message.answer("😔 К сожалению, сейчас нет открытых кружков для записи.")
+        return
+
+    buttons = [[InlineKeyboardButton(text=k[1], callback_data=f"zapis_{k[0]}")] for k in kruzhki]
+    await message.answer(
+        "📝 <b>Запись на кружок</b>\n\nВыбери кружок:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+async def start_zayavka(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.data is None or callback.message is None:
+        return
+    if not isinstance(callback.message, Message):
+        await callback.answer("Сообщение недоступно.")
+        return
+
+    await state.clear()
+    kruzhok_id = int(callback.data.split("_")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM kruzhki WHERE id = ?", (kruzhok_id,))
+    k = cur.fetchone()
+    conn.close()
+
+    if not k:
+        await callback.answer("Кружок не найден!")
+        return
+
+    await state.update_data(kruzhok_id=kruzhok_id, kruzhok_name=k[0])
+    await state.set_state(ZayavkaForm.full_name)
+
+    await callback.message.answer(
+        f"📝 <b>Запись на кружок «{k[0]}»</b>\n\n"
+        "Шаг 1/4: Напишите своё <b>полное имя (ФИО)</b>:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await callback.answer()
+
+async def zayavka_full_name(message: Message, state: FSMContext) -> None:
+    text = message.text or ""
+    if len(text.strip()) < 5:
+        await message.answer("❌ Пожалуйста, введите полное ФИО (минимум 5 символов).")
+        return
+    await state.update_data(full_name=text.strip())
+    await state.set_state(ZayavkaForm.age)
+    await message.answer("Шаг 2/4: Введите ваш <b>возраст</b> (число):", parse_mode="HTML")
+
+async def zayavka_age(message: Message, state: FSMContext) -> None:
+    text = message.text or ""
+    if not text.strip().isdigit() or not (10 <= int(text.strip()) <= 18):
+        await message.answer("❌ Введите корректный возраст (от 10 до 18 лет).")
+        return
+    await state.update_data(age=int(text.strip()))
+    await state.set_state(ZayavkaForm.phone)
+    await message.answer(
+        "Шаг 3/4: Введите <b>номер телефона</b> для связи:\nПример: +7 777 123 45 67",
+        parse_mode="HTML"
+    )
+
+async def zayavka_phone(message: Message, state: FSMContext) -> None:
+    phone = (message.text or "").strip()
+    if len(phone) < 7:
+        await message.answer("❌ Введите корректный номер телефона.")
+        return
+    await state.update_data(phone=phone)
+    await state.set_state(ZayavkaForm.comment)
+    await message.answer(
+        "Шаг 4/4: Добавьте <b>комментарий</b> (необязательно).\n"
+        "Или напишите <b>«нет»</b>, чтобы пропустить:",
+        parse_mode="HTML"
+    )
+
+async def zayavka_comment(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    comment = "" if raw.lower() in ["нет", "нет.", "-", "no"] else raw
+    await state.update_data(comment=comment)
+    await state.set_state(ZayavkaForm.confirm)
+
+    data = await state.get_data()
+    await message.answer(
+        f"📋 <b>Проверьте вашу заявку:</b>\n\n"
+        f"👤 ФИО: {data['full_name']}\n"
+        f"🎂 Возраст: {data['age']}\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"📚 Кружок: {data['kruzhok_name']}\n"
+        f"💬 Комментарий: {comment if comment else 'нет'}\n\n"
+        f"Всё верно?",
+        parse_mode="HTML",
+        reply_markup=zayavka_confirm_keyboard()
+    )
+
+async def zayavka_confirm_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    user = callback.from_user
+    if user is None:
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO zayavki (tg_id, full_name, age, phone, kruzhok_id, kruzhok_name, comment, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            user.id,
+            data["full_name"],
+            data["age"],
+            data["phone"],
+            data["kruzhok_id"],
+            data["kruzhok_name"],
+            data.get("comment", ""),
+            "новая",
+            datetime.now().strftime("%d.%m.%Y %H:%M")
+        )
+    )
+    zayavka_id: int = cur.lastrowid or 0
+    conn.commit()
+    conn.close()
+
+    is_admin = user.id in ADMIN_IDS
+    kb = admin_keyboard() if is_admin else main_keyboard()
+
+    await callback.message.edit_text(
+        f"✅ <b>Заявка №{zayavka_id} успешно подана!</b>\n\n"
+        f"📚 Кружок: {data['kruzhok_name']}\n"
+        f"⏳ Статус: <b>новая</b>\n\n"
+        f"Администратор свяжется с вами по номеру {data['phone']}.\n"
+        f"Следить за статусом: кнопка «📋 Мои заявки»",
+        parse_mode="HTML"
+    )
+    await callback.message.answer("Главное меню 👇", reply_markup=kb)
+
+    # Уведомление администраторам
+    bot = callback.bot
+    if bot is not None:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🔔 <b>Новая заявка №{zayavka_id}!</b>\n\n"
+                    f"👤 {data['full_name']}\n"
+                    f"🎂 Возраст: {data['age']}\n"
+                    f"📞 {data['phone']}\n"
+                    f"📚 {data['kruzhok_name']}\n"
+                    f"💬 {data.get('comment', 'нет')}",
+                    parse_mode="HTML",
+                    reply_markup=zayavka_status_keyboard(zayavka_id)
+                )
+            except Exception:
+                pass
+
+    await callback.answer("Заявка подана!")
+
+async def zayavka_confirm_no(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    user = callback.from_user
+    if user is None:
+        return
+
+    await state.clear()
+    is_admin = user.id in ADMIN_IDS
+    kb = admin_keyboard() if is_admin else main_keyboard()
+    await callback.message.edit_text("❌ Заявка отменена.")
+    await callback.message.answer("Главное меню 👇", reply_markup=kb)
+    await callback.answer()
+
+# ===== МОИ ЗАЯВКИ =====
+async def my_zayavki(message: Message) -> None:
+    user = message.from_user
+    if user is None:
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, kruzhok_name, status, created_at FROM zayavki WHERE tg_id = ? ORDER BY id DESC",
+        (user.id,)
+    )
+    zayavki = cur.fetchall()
+    conn.close()
+
+    if not zayavki:
+        await message.answer("📋 У вас пока нет заявок.\n\nНажмите «📝 Подать заявку», чтобы записаться.")
+        return
+
+    status_icons = {"новая": "🆕", "одобрена": "✅", "отклонена": "❌", "в ожидании": "⏳"}
+    text = "📋 <b>Ваши заявки:</b>\n\n"
+    for z in zayavki:
+        icon = status_icons.get(z[2], "📌")
+        text += f"{icon} <b>Заявка №{z[0]}</b>\n   📚 {z[1]}\n   📊 Статус: {z[2]}\n   📅 {z[3]}\n\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+# ===== НОВОСТИ =====
+async def show_news(message: Message) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT title, content, created_at FROM novosti ORDER BY id DESC LIMIT 5")
+    news = cur.fetchall()
+    conn.close()
+
+    if not news:
+        await message.answer("📰 Новостей пока нет.")
+        return
+
+    text = "📰 <b>Последние новости Digital Urqaq:</b>\n\n"
+    for n in news:
+        text += f"📌 <b>{n[0]}</b>\n{n[1]}\n📅 {n[2]}\n\n{'—'*30}\n\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+# ===== О НАС / КОНТАКТЫ =====
+async def about_us(message: Message) -> None:
+    await message.answer(
+        "🏫 <b>Дворец школьников Digital Urqaq</b>\n\n"
+        "Мы — современный образовательный центр для детей и подростков от 10 до 18 лет.\n\n"
+        "🎯 <b>Наши направления:</b>\n"
+        "• IT и программирование\n"
+        "• Робототехника\n"
+        "• Дизайн и творчество\n"
+        "• Иностранные языки\n"
+        "• Спорт и шахматы\n\n"
+        "📍 Каждый найдёт кружок по душе!\n\n"
+        "📞 <b>Контакты:</b>\n"
+        "📍 г. Петропавловск, ул. Жамбыла, 55а\n"
+        "📱 Приёмная: +7 (7152) 34-02-40\n"
+        "📱 Справочная: +7 (7152) 50-17-03\n"
+        "🕐 Пн–Пт 09:00–21:00, Сб–Вс выходной\n"
+        "🗺 <a href=\"https://2gis.kz/petropavlovsk/geo/70030076175767224\">Открыть на 2GIS</a>",
+        parse_mode="HTML"
+    )
+
+async def contacts(message: Message) -> None:
+    await message.answer(
+        "📞 <b>Контакты Digital Urqaq:</b>\n\n"
+        "📍 Адрес: г. Петропавловск, ул. Жамбыла, 55а\n"
+        "📱 Приёмная: +7 (7152) 34-02-40\n"
+        "📱 Справочная: +7 (7152) 50-17-03\n"
+        "🕐 Режим работы: Пн–Пт 09:00–21:00, Сб–Вс выходной\n"
+        "🗺 <a href=\"https://2gis.kz/petropavlovsk/geo/70030076175767224\">Открыть на 2GIS</a>",
+        parse_mode="HTML"
+    )
+
+# ===== АДМИН-ПАНЕЛЬ =====
+async def admin_panel(message: Message) -> None:
+    user = message.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет доступа к админ-панели.")
+        return
+    await message.answer(
+        "🔧 <b>Админ-панель Digital Urqaq</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=admin_panel_keyboard()
+    )
+
+async def admin_all_zayavki(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, full_name, kruzhok_name, status, created_at FROM zayavki ORDER BY id DESC LIMIT 10")
+    zayavki = cur.fetchall()
+    conn.close()
+
+    if not zayavki:
+        await callback.message.edit_text("📋 Заявок пока нет.")
+        await callback.answer()
+        return
+
+    status_icons = {"новая": "🆕", "одобрена": "✅", "отклонена": "❌", "в ожидании": "⏳"}
+    text = "📋 <b>Последние заявки (10 шт.):</b>\n\n"
+    buttons = []
+    for z in zayavki:
+        icon = status_icons.get(z[3], "📌")
+        text += f"{icon} №{z[0]} | {z[1]} | {z[2]} | {z[3]}\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} №{z[0]} — {z[1][:15]}",
+            callback_data=f"admin_z_{z[0]}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+async def admin_zayavka_detail(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.data is None or callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    zayavka_id = int(callback.data.split("_")[2])
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM zayavki WHERE id = ?", (zayavka_id,))
+    z = cur.fetchone()
+    conn.close()
+
+    if not z:
+        await callback.answer("Заявка не найдена!")
+        return
+
+    text = (
+        f"📋 <b>Заявка №{z[0]}</b>\n\n"
+        f"👤 ФИО: {z[2]}\n"
+        f"🎂 Возраст: {z[3]}\n"
+        f"📞 Телефон: {z[4]}\n"
+        f"📚 Кружок: {z[6]}\n"
+        f"💬 Комментарий: {z[7] if z[7] else 'нет'}\n"
+        f"📊 Статус: <b>{z[8]}</b>\n"
+        f"📅 Дата: {z[9]}"
+    )
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=zayavka_status_keyboard(zayavka_id)
+    )
+    await callback.answer()
+
+async def change_zayavka_status(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.data is None or callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    parts = callback.data.split("_")
+    action = parts[0]
+    zayavka_id = int(parts[1])
+
+    status_map = {"approve": "одобрена", "reject": "отклонена", "pending": "в ожидании"}
+    new_status = status_map.get(action, "в ожидании")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE zayavki SET status = ? WHERE id = ?", (new_status, zayavka_id))
+    cur.execute("SELECT tg_id, kruzhok_name FROM zayavki WHERE id = ?", (zayavka_id,))
+    z = cur.fetchone()
+    conn.commit()
+    conn.close()
+
+    status_icons = {"одобрена": "✅", "отклонена": "❌", "в ожидании": "⏳"}
+    icon = status_icons.get(new_status, "📌")
+
+    await callback.answer(f"Статус обновлён: {new_status}")
+    await callback.message.edit_text(
+        f"{icon} Заявка №{zayavka_id} — статус изменён на <b>{new_status}</b>",
+        parse_mode="HTML"
+    )
+
+    if z is not None:
+        bot = callback.bot
+        if bot is not None:
+            tg_id = z[0]
+            kruzhok_name = z[1]
+            msg_texts = {
+                "одобрена": f"✅ Ваша заявка на кружок «{kruzhok_name}» <b>одобрена</b>! Ждём вас!",
+                "отклонена": f"❌ Ваша заявка на кружок «{kruzhok_name}» <b>отклонена</b>. Свяжитесь с нами для уточнений.",
+                "в ожидании": f"⏳ Ваша заявка на кружок «{kruzhok_name}» находится <b>в ожидании</b>. Мы сообщим вам позже."
+            }
+            try:
+                await bot.send_message(tg_id, msg_texts[new_status], parse_mode="HTML")
+            except Exception:
+                pass
+
+async def admin_new_zayavki(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, full_name, kruzhok_name, created_at FROM zayavki WHERE status = 'новая' ORDER BY id DESC")
+    zayavki = cur.fetchall()
+    conn.close()
+
+    if not zayavki:
+        await callback.message.edit_text(
+            "✅ Новых заявок нет!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]])
+        )
+        await callback.answer()
+        return
+
+    buttons = []
+    for z in zayavki:
+        buttons.append([InlineKeyboardButton(
+            text=f"🆕 №{z[0]} — {z[1][:15]}",
+            callback_data=f"admin_z_{z[0]}"
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")])
+
+    await callback.message.edit_text(
+        f"🆕 <b>Новые заявки ({len(zayavki)} шт.):</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+async def admin_stats(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM zayavki")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM zayavki WHERE status = 'новая'")
+    new = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM zayavki WHERE status = 'одобрена'")
+    approved = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM zayavki WHERE status = 'отклонена'")
+    rejected = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM kruzhki")
+    kruzhki_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM kruzhki WHERE is_open = 1")
+    open_kruzhki = cur.fetchone()[0]
+    conn.close()
+
+    await callback.message.edit_text(
+        f"📊 <b>Статистика Digital Urqaq</b>\n\n"
+        f"📋 Всего заявок: <b>{total}</b>\n"
+        f"🆕 Новых: <b>{new}</b>\n"
+        f"✅ Одобрено: <b>{approved}</b>\n"
+        f"❌ Отклонено: <b>{rejected}</b>\n\n"
+        f"📚 Всего кружков: <b>{kruzhki_count}</b>\n"
+        f"✅ Открытых: <b>{open_kruzhki}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]])
+    )
+    await callback.answer()
+
+# ===== ДОБАВИТЬ НОВОСТЬ =====
+async def admin_add_news_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    await state.set_state(AdminNews.title)
+    await callback.message.answer(
+        "📢 <b>Новая новость</b>\n\nВведите <b>заголовок</b>:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await callback.answer()
+
+async def admin_news_title(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    await state.update_data(title=text)
+    await state.set_state(AdminNews.content)
+    await message.answer("Введите <b>текст новости</b>:", parse_mode="HTML")
+
+async def admin_news_content(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+
+    content = (message.text or "").strip()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO novosti (title, content, created_at) VALUES (?, ?, ?)",
+        (data["title"], content, datetime.now().strftime("%d.%m.%Y"))
+    )
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        f"✅ <b>Новость опубликована!</b>\n\n📌 {data['title']}",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard()
+    )
+
+# ===== ДОБАВИТЬ КРУЖОК =====
+async def admin_add_kruzhok_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user = callback.from_user
+    if user is None or user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа!")
+        return
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    await state.set_state(AdminKruzhok.name)
+    await callback.message.answer(
+        "➕ <b>Новый кружок</b>\n\nВведите <b>название кружка</b>:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await callback.answer()
+
+async def admin_kruzhok_name(message: Message, state: FSMContext) -> None:
+    await state.update_data(name=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.description)
+    await message.answer("Введите <b>описание</b>:", parse_mode="HTML")
+
+async def admin_kruzhok_description(message: Message, state: FSMContext) -> None:
+    await state.update_data(description=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.direction)
+    await message.answer("Введите <b>направление</b> (напр. IT, Спорт, Творчество):", parse_mode="HTML")
+
+async def admin_kruzhok_direction(message: Message, state: FSMContext) -> None:
+    await state.update_data(direction=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.age_category)
+    await message.answer("Введите <b>возрастную категорию</b> (напр. 14-18 лет):", parse_mode="HTML")
+
+async def admin_kruzhok_age(message: Message, state: FSMContext) -> None:
+    await state.update_data(age_category=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.teacher)
+    await message.answer("Введите <b>ФИО преподавателя</b>:", parse_mode="HTML")
+
+async def admin_kruzhok_teacher(message: Message, state: FSMContext) -> None:
+    await state.update_data(teacher=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.schedule)
+    await message.answer("Введите <b>расписание</b> (напр. Пн, Ср 15:00-17:00):", parse_mode="HTML")
+
+async def admin_kruzhok_schedule(message: Message, state: FSMContext) -> None:
+    await state.update_data(schedule=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.room)
+    await message.answer("Введите <b>кабинет / место проведения</b>:", parse_mode="HTML")
+
+async def admin_kruzhok_room(message: Message, state: FSMContext) -> None:
+    await state.update_data(room=(message.text or "").strip())
+    await state.set_state(AdminKruzhok.max_slots)
+    await message.answer("Введите <b>количество мест</b> (число):", parse_mode="HTML")
+
+async def admin_kruzhok_slots(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Введите число.")
+        return
+    data = await state.get_data()
+    await state.clear()
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO kruzhki (name, description, direction, age_category, teacher, schedule, room, max_slots, is_open) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        (
+            data["name"], data["description"], data["direction"], data["age_category"],
+            data["teacher"], data["schedule"], data["room"], int(text)
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        f"✅ <b>Кружок «{data['name']}» добавлен!</b>",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard()
+    )
+
+async def admin_back(callback: CallbackQuery) -> None:
+    if callback.message is None or not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "🔧 <b>Админ-панель Digital Urqaq</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=admin_panel_keyboard()
+    )
+    await callback.answer()
+
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = message.from_user
+    is_admin = user is not None and user.id in ADMIN_IDS
+    kb = admin_keyboard() if is_admin else main_keyboard()
+    await message.answer("❌ Действие отменено.", reply_markup=kb)
+
+# ===== ЗАПУСК =====
+async def main() -> None:
+    init_db()
+    bot = Bot(token=BOT_TOKEN)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_cancel, Command("cancel"))
+    dp.message.register(cmd_cancel, F.text == "❌ Отмена")
+
+    dp.message.register(show_kruzhki, F.text == "📚 Кружки")
+    dp.message.register(start_zayavka_menu, F.text == "📝 Подать заявку")
+    dp.message.register(show_news, F.text == "📰 Новости")
+    dp.message.register(my_zayavki, F.text == "📋 Мои заявки")
+    dp.message.register(about_us, F.text == "ℹ️ О нас")
+    dp.message.register(contacts, F.text == "📞 Контакты")
+    dp.message.register(admin_panel, F.text == "🔧 Админ-панель")
+
+    dp.message.register(zayavka_full_name, ZayavkaForm.full_name)
+    dp.message.register(zayavka_age, ZayavkaForm.age)
+    dp.message.register(zayavka_phone, ZayavkaForm.phone)
+    dp.message.register(zayavka_comment, ZayavkaForm.comment)
+
+    dp.message.register(admin_news_title, AdminNews.title)
+    dp.message.register(admin_news_content, AdminNews.content)
+
+    dp.message.register(admin_kruzhok_name, AdminKruzhok.name)
+    dp.message.register(admin_kruzhok_description, AdminKruzhok.description)
+    dp.message.register(admin_kruzhok_direction, AdminKruzhok.direction)
+    dp.message.register(admin_kruzhok_age, AdminKruzhok.age_category)
+    dp.message.register(admin_kruzhok_teacher, AdminKruzhok.teacher)
+    dp.message.register(admin_kruzhok_schedule, AdminKruzhok.schedule)
+    dp.message.register(admin_kruzhok_room, AdminKruzhok.room)
+    dp.message.register(admin_kruzhok_slots, AdminKruzhok.max_slots)
+
+    dp.callback_query.register(kruzhok_detail, F.data.startswith("kruzhok_"))
+    dp.callback_query.register(back_to_kruzhki, F.data == "back_kruzhki")
+    dp.callback_query.register(start_zayavka, F.data.startswith("zapis_"))
+    dp.callback_query.register(zayavka_confirm_yes, F.data == "confirm_yes", ZayavkaForm.confirm)
+    dp.callback_query.register(zayavka_confirm_no, F.data == "confirm_no", ZayavkaForm.confirm)
+    dp.callback_query.register(admin_all_zayavki, F.data == "admin_all_zayavki")
+    dp.callback_query.register(admin_new_zayavki, F.data == "admin_new_zayavki")
+    dp.callback_query.register(admin_add_news_start, F.data == "admin_add_news")
+    dp.callback_query.register(admin_add_kruzhok_start, F.data == "admin_add_kruzhok")
+    dp.callback_query.register(admin_stats, F.data == "admin_stats")
+    dp.callback_query.register(admin_zayavka_detail, F.data.startswith("admin_z_"))
+    dp.callback_query.register(admin_back, F.data == "admin_back")
+    dp.callback_query.register(change_zayavka_status, F.data.startswith("approve_"))
+    dp.callback_query.register(change_zayavka_status, F.data.startswith("reject_"))
+    dp.callback_query.register(change_zayavka_status, F.data.startswith("pending_"))
+
+    logger.info("🤖 Бот Digital Urqaq запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
